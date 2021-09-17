@@ -1,11 +1,47 @@
 /****************************************************************************
- *  Author: Flavio Peter <flaviop313@gmail.com> 2021                        *
+ *  Author: Flavio Peter <flaviop313@gmail.com> 09 2021                     *
  ****************************************************************************/
 
-#include <curses.h>
 #include <stdlib.h>
-#include <time.h>
 #include <unistd.h>
+#include <time.h>
+#include <signal.h>
+#include <curses.h>
+#include <sys/ioctl.h>
+
+// Indicates a caught signal
+volatile sig_atomic_t signal_status = 0; 
+
+void sighandler(int s) {
+    signal_status = s;
+}
+
+void usage() {
+  printf(" Usage: fire -[h] [-i iterations] [-s speed]\n");
+  printf(" -h: Print usage and exit\n");
+  printf(" -i: Number of iterations before the fire goes out (-1 to keep the fire burning indefinitely)\n");
+  printf(" -s: Speed to update the fire animation in milliseconds\n");
+}
+
+void freeHeap(unsigned int** fb) {
+  // free memory used by framebuffer from heap
+  for (int i = 0; i < COLS; ++i) {
+    free(fb[i]);
+  }
+  free(fb);
+}
+
+void resizeScreen() {
+  // set new terminal size
+  struct winsize win;
+  ioctl(0, TIOCGWINSZ, &win);
+  COLS = win.ws_col;
+  LINES = win.ws_row;
+  resizeterm(LINES, COLS);
+
+  endwin();
+  refresh();
+}
 
 void initCustomColors() {
   unsigned int colors[37][3] = {
@@ -58,7 +94,7 @@ void initCustomColors() {
   init_pair(0, COLOR_BLACK, COLOR_BLACK);
 }
 
-void draw(unsigned int fb[][LINES]) {
+void draw(unsigned int** fb) {
   // dont' draw the last line, it's only white anyway
   for (unsigned int y = 0; y < LINES-1; ++y) {
     for (unsigned int x = 0; x < COLS; ++x) {
@@ -70,7 +106,7 @@ void draw(unsigned int fb[][LINES]) {
   refresh();
 }
 
-void spreadFire(unsigned int x, unsigned int y, unsigned int fb[][LINES]) { 
+void spreadFire(unsigned int x, unsigned int y, unsigned int** fb) { 
   // fire propagates randomly up, left and right 
   unsigned int ry = rand() % 4; // ry in [ 0 ; 3 ]
   unsigned int rx = rand() % 3; // rx in [ 0 ; 2 ]
@@ -81,21 +117,25 @@ void spreadFire(unsigned int x, unsigned int y, unsigned int fb[][LINES]) {
      heat = 0;
   
   int ny = y - ry;
-  if (ny < 0) // no negativ index
+  // no negativ index
+  if (ny < 0) 
     ny = 0;
-  if (ny >= LINES-1) // bottom most line has to stay white.
+  // bottom most line has to stay white
+  if (ny >= LINES-1) 
     ny = LINES-2;
 
   int nx = x - rx + 1;
-  if (nx < 0) // no negativ index
+  // no negativ index
+  if (nx < 0) 
     nx = 0;
-  if (nx >= COLS) // don't go out of array
+  // don't go out of array
+  if (nx >= COLS) 
     nx = COLS - 1;
 
   fb[nx][ny] = heat;
 }
 
-void doFire(unsigned int fb[][LINES]) {
+void doFire(unsigned int** fb) {
   // iterrate through the framebuffer and spread the fire
   for(unsigned int y = 0 ; y < LINES; ++y) {
     for (unsigned int x = 0; x < COLS; ++x) {
@@ -107,13 +147,44 @@ void doFire(unsigned int fb[][LINES]) {
 void quit()
 {
   endwin();
+  exit(0);
 }
 
-int main(void)
+
+
+int main(int argc, char* argv[])
 {
-  srand(time(NULL)); // init random-numbers
-  initscr(); // has to be called here, so COLS and LINES are defined
-  unsigned int framebuffer[COLS][LINES];
+  int optchr;
+  unsigned int count = 0;
+  int iterations = -1;
+  // update cycle in ms
+  int speed = 70;
+
+  opterr = 0;
+  while ((optchr = getopt(argc, argv, "hi:s:")) != EOF) {
+    switch (optchr) {
+      case 'h':
+      case '?':
+        usage();
+        quit();
+      case 'i': 
+        iterations = atoi(optarg);
+        break;
+      case 's': 
+        speed = atoi(optarg);
+        break;
+    }
+  }
+
+  // init random-numbers
+  srand(time(NULL));
+  // has to be called here, so COLS and LINES are defined
+  initscr();
+  // create framebuffer array using pionters, so it can be resized
+  unsigned int** framebuffer = (unsigned int**)malloc(COLS * sizeof(unsigned int*));
+  for (int i = 0; i < COLS; ++i)
+    framebuffer[i] = (unsigned int*)malloc(LINES * sizeof(unsigned int));
+  
   for (unsigned int y = 0; y < LINES; ++y) {
     for (unsigned int x = 0; x < COLS; ++x) {
       // fill framebuffer with black / colorpair 0
@@ -128,15 +199,58 @@ int main(void)
   curs_set(0); // no blinking cursor
   start_color();
   initCustomColors();
+  keypad(stdscr, true);
   clear();
+
+  signal(SIGINT, sighandler);
+  signal(SIGQUIT, sighandler);
+  signal(SIGWINCH, sighandler);
+  signal(SIGTSTP, sighandler);
 
   // loop to let the fire burn
   while (1) {
+
+    if (signal_status == SIGINT || signal_status == SIGQUIT || signal_status == SIGTSTP) {
+      freeHeap(framebuffer);
+      quit();
+    }
+
+    if (signal_status == SIGWINCH) {
+      freeHeap(framebuffer);
+      resizeScreen();
+      // reallocate memory for framebuffer with updated COLS and LINES
+      framebuffer = (unsigned int**)malloc(COLS * sizeof(unsigned int*));
+      for (int i = 0; i < COLS; ++i)
+        framebuffer[i] = (unsigned int*)malloc(LINES * sizeof(unsigned int));
+      for (unsigned int y = 0; y < LINES; ++y) {
+        for (unsigned int x = 0; x < COLS; ++x) {
+          // fill framebuffer with black / colorpair 0
+          framebuffer[x][y] = 0;
+        }
+      }
+      for (unsigned int x = 0; x < COLS; ++x) {
+        // bottom most line is the source of the fire, white color / colorpair: 136
+        framebuffer[x][LINES-1] = 136;
+      }
+      signal_status = 0;
+    }
+
+    if (iterations != -1 && count >= iterations) {
+      if (count == iterations + 120)
+        quit();
+      for (unsigned int x = 0; x < COLS; ++x) {
+        // set the bottom most line to 0, to extinguish the fire
+        framebuffer[x][LINES-1] = 0;
+      }
+    }
+
     doFire(framebuffer);
     draw(framebuffer);
-    usleep(70000);
+    usleep(speed * 1000);
+    ++count;
   }
 
+  freeHeap(framebuffer);
   quit();
   return(0);
 }
